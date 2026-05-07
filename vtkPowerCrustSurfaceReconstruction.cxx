@@ -25,6 +25,13 @@
 #include "vtkDataObject.h"
 #include "vtkSmartPointer.h"
 
+#ifdef PC_USE_OPENMP
+#  include <omp.h>
+#endif
+#ifdef PC_USE_AVX2
+#  include <immintrin.h>
+#endif
+
 
 vtkStandardNewMacro(vtkPowerCrustSurfaceReconstruction);
 
@@ -2497,17 +2504,16 @@ void adapted_main()
 
 void compute_distance(simplex** poles,int size,double* distance) {
 
-    int i,j,k,l;
-    double indices[4][3]; /* the coords of the four vertices of the simplex*/
-    point v[MAXDIM];
-    simplex* currSimplex;
-
-
-
-    double maxdistance=0;
-    double currdistance;
-
-    for(l=0;l<size;l++) {  /* for each pole do*/
+#ifdef PC_USE_OPENMP
+    #pragma omp parallel for schedule(dynamic, 64)
+#endif
+    for(int l=0;l<size;l++) {  /* for each pole do – each iteration is independent */
+        int i,j,k;
+        double indices[4][3]; /* the coords of the four vertices of the simplex*/
+        point v[MAXDIM];
+        simplex* currSimplex;
+        double maxdistance=0;
+        double currdistance;
 
         if(poles[l]!=NULL) {
             currSimplex=poles[l];
@@ -6500,56 +6506,144 @@ void label_unlabeled(int num)
 
 //#include "hull.h" /* sunghee */  TJH: this file is now above
 
+/* =========================================================================
+   Vector math primitives.
+   When PC_USE_AVX2 is defined (and the compiler supports -mavx2 / /arch:AVX2)
+   we use 256-bit AVX2 double-precision vectors for the hot-path operations.
+   All routines have identical scalar fallbacks so the code is correct on any
+   platform.
+   ========================================================================= */
+
+#ifdef PC_USE_AVX2
+/* --------------------------------------------------------------------------
+   AVX2 helpers: operate on 3-element double vectors packed into __m256d
+   (the 4th lane is zeroed / unused).
+   -------------------------------------------------------------------------- */
+
+/* Load 3 doubles into the low lanes of a __m256d; 4th lane = 0. */
+static inline __m256d pc_load3(const double* p)
+{
+    return _mm256_set_pd(0.0, p[2], p[1], p[0]);
+}
+
+/* Horizontal sum of the first 3 lanes of a __m256d. */
+static inline double pc_hsum3(__m256d v)
+{
+    __m128d lo  = _mm256_castpd256_pd128(v);     /* [v0, v1] */
+    __m128d hi  = _mm256_extractf128_pd(v, 1);  /* [v2,  0] */
+    __m128d sum = _mm_add_pd(lo, hi);            /* [v0+v2, v1] */
+    return _mm_cvtsd_f64(_mm_hadd_pd(sum, sum)); /* v0+v2+v1 */
+}
+
+/* Store the first 3 lanes of a __m256d back to an array. */
+static inline void pc_store3(double* p, __m256d v)
+{
+    double tmp[4];
+    _mm256_storeu_pd(tmp, v);
+    p[0] = tmp[0]; p[1] = tmp[1]; p[2] = tmp[2];
+}
+#endif /* PC_USE_AVX2 */
+
+/* normalize: scale a[3] to unit length in-place */
 void normalize(double a[3])
 {
-    double t;
-
-    t =SQ(a[0])+SQ(a[1])+SQ(a[2]);
-    t = sqrt(t);
+#ifdef PC_USE_AVX2
+    __m256d va  = pc_load3(a);
+    __m256d sq  = _mm256_mul_pd(va, va);
+    double  t   = sqrt(pc_hsum3(sq));
+    __m256d vt  = _mm256_set1_pd(t);
+    pc_store3(a, _mm256_div_pd(va, vt));
+#else
+    double t = sqrt(SQ(a[0])+SQ(a[1])+SQ(a[2]));
     a[0]=a[0]/t;
-    a[2]=a[2]/t;
     a[1]=a[1]/t;
+    a[2]=a[2]/t;
+#endif
 }
 
+/* sqdist: squared Euclidean distance between a and b */
 double sqdist(double a[3], double b[3])
 {
-  /* returns the squared distance between a and b */
-  return SQ(a[0]-b[0])+SQ(a[1]-b[1])+SQ(a[2]-b[2]);
+#ifdef PC_USE_AVX2
+    __m256d va   = pc_load3(a);
+    __m256d vb   = pc_load3(b);
+    __m256d diff = _mm256_sub_pd(va, vb);
+    __m256d sq   = _mm256_mul_pd(diff, diff);
+    return pc_hsum3(sq);
+#else
+    return SQ(a[0]-b[0])+SQ(a[1]-b[1])+SQ(a[2]-b[2]);
+#endif
 }
 
-void dir_and_dist(double a[3], double b[3], double dir[3], double* dist) {
+/* dir_and_dist: unit direction vector and Euclidean distance from a to b */
+void dir_and_dist(double a[3], double b[3], double dir[3], double* dist)
+{
+#ifdef PC_USE_AVX2
+    __m256d va   = pc_load3(a);
+    __m256d vb   = pc_load3(b);
+    __m256d diff = _mm256_sub_pd(vb, va);          /* b - a */
+    __m256d sq   = _mm256_mul_pd(diff, diff);
+    *dist        = sqrt(pc_hsum3(sq));
+    __m256d vd   = _mm256_set1_pd(*dist);
+    pc_store3(dir, _mm256_div_pd(diff, vd));
+#else
     int k;
-
     for (k=0; k<3; k++) dir[k] = b[k] - a[k];
-    *dist = sqrt( SQ(dir[0])+SQ(dir[1])+SQ(dir[2]));
+    *dist = sqrt(SQ(dir[0])+SQ(dir[1])+SQ(dir[2]));
     for (k=0; k<3; k++) dir[k] = dir[k] / (*dist);
+#endif
 }
 
-
-
+/* crossabc: normalised cross product of (b-a) × (c-a), stored in n */
 void crossabc(double a[3], double b[3], double c[3], double n[3])
 {
-    double t;
-
+    /* Cross product is inherently sequential across components; we
+       compute it scalar-style and then normalise with AVX2. */
     n[0] = (b[1]-a[1])*(c[2]-a[2]) - (b[2]-a[2])*(c[1]-a[1]);
     n[1] = (b[2]-a[2])*(c[0]-a[0]) - (b[0]-a[0])*(c[2]-a[2]);
     n[2] = (a[0]-b[0])*(a[1]-c[1]) - (a[1]-b[1])*(a[0]-c[0]);
-    t =SQ(n[0])+SQ(n[1])+SQ(n[2]);
-    t = sqrt(t);
+
+#ifdef PC_USE_AVX2
+    __m256d vn  = pc_load3(n);
+    __m256d sq  = _mm256_mul_pd(vn, vn);
+    double  t   = sqrt(pc_hsum3(sq));
+    __m256d vt  = _mm256_set1_pd(t);
+    pc_store3(n, _mm256_div_pd(vn, vt));
+#else
+    double t = sqrt(SQ(n[0])+SQ(n[1])+SQ(n[2]));
     n[0]=n[0]/t;
-    n[2]=n[2]/t;
     n[1]=n[1]/t;
-    /* normalized */
+    n[2]=n[2]/t;
+#endif
+    /* result is normalised */
 }
 
+/* dotabac: dot product of (b-a) · (c-a) */
 double dotabac(double a[3], double b[3], double c[3])
 {
-    return (b[0]-a[0])*(c[0]-a[0])+(b[1]-a[1])*(c[1]-a[1])+(b[2]-a[2])*(c[2]-a[2]);
+#ifdef PC_USE_AVX2
+    __m256d va   = pc_load3(a);
+    __m256d vba  = _mm256_sub_pd(pc_load3(b), va);   /* b-a */
+    __m256d vca  = _mm256_sub_pd(pc_load3(c), va);   /* c-a */
+    return pc_hsum3(_mm256_mul_pd(vba, vca));
+#else
+    return (b[0]-a[0])*(c[0]-a[0])
+          +(b[1]-a[1])*(c[1]-a[1])
+          +(b[2]-a[2])*(c[2]-a[2]);
+#endif
 }
 
+/* dotabc: dot product of (b-a) · c */
 double dotabc(double a[3], double b[3], double c[3])
 {
+#ifdef PC_USE_AVX2
+    __m256d va  = pc_load3(a);
+    __m256d vba = _mm256_sub_pd(pc_load3(b), va);   /* b-a */
+    __m256d vc  = pc_load3(c);
+    return pc_hsum3(_mm256_mul_pd(vba, vc));
+#else
     return (b[0]-a[0])*c[0]+(b[1]-a[1])*c[1]+(b[2]-a[2])*c[2];
+#endif
 }
 
 /*****************************************************************************/
