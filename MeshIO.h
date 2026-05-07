@@ -2,7 +2,8 @@
   MeshIO.h  –  VTK-free mesh reader/writer for PowerCrust
   Supported formats (auto-detected from file extension):
     .obj  – Wavefront OBJ  (read + write)
-    .ply  – Stanford PLY   (ASCII read + write; binary PLY gives a clear error)
+    .ply  – Stanford PLY   (ASCII, binary little-endian, binary big-endian;
+                            read + write)
     .gii  – GIFTI surface  (read: ASCII + Base64Binary encodings)
     .off  – Object File Format (read + write)
 =========================================================================*/
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -81,44 +83,201 @@ static bool WriteOBJ(const PCMesh& mesh, const std::string& path)
     return true;
 }
 
-// ── PLY reader (ASCII only) ───────────────────────────────────────────────────
+// ── PLY reader (ASCII + binary little/big-endian) ────────────────────────────
+
+namespace ply_detail {
+
+enum class Fmt { ASCII, BIN_LE, BIN_BE };
+
+// Scalar type sizes used in binary PLY properties.
+static int ply_type_size(const std::string& t)
+{
+    if (t=="char"||t=="uchar"||t=="int8"||t=="uint8") return 1;
+    if (t=="short"||t=="ushort"||t=="int16"||t=="uint16") return 2;
+    if (t=="int"||t=="uint"||t=="int32"||t=="uint32"||t=="float"||t=="float32") return 4;
+    if (t=="double"||t=="float64"||t=="int64"||t=="uint64") return 8;
+    return 4; // safe fallback
+}
+
+// Read bytes from stream and byte-swap if big-endian.
+template<typename T>
+static T ply_read(std::istream& s, bool swap)
+{
+    T v;
+    s.read(reinterpret_cast<char*>(&v), sizeof(T));
+    if (swap) {
+        auto* b = reinterpret_cast<uint8_t*>(&v);
+        std::reverse(b, b + sizeof(T));
+    }
+    return v;
+}
+
+// Read a PLY scalar of given type, return as double.
+static double ply_read_scalar(std::istream& s, const std::string& t, bool swap)
+{
+    if (t=="float"||t=="float32") return ply_read<float>(s, swap);
+    if (t=="double"||t=="float64") return ply_read<double>(s, swap);
+    if (t=="int"||t=="int32")   return ply_read<int32_t>(s, swap);
+    if (t=="uint"||t=="uint32") return ply_read<uint32_t>(s, swap);
+    if (t=="short"||t=="int16") return ply_read<int16_t>(s, swap);
+    if (t=="ushort"||t=="uint16") return ply_read<uint16_t>(s, swap);
+    if (t=="char"||t=="int8")   return ply_read<int8_t>(s, swap);
+    if (t=="uchar"||t=="uint8") return ply_read<uint8_t>(s, swap);
+    return ply_read<float>(s, swap);
+}
+
+// Read a PLY scalar as int32.
+static int32_t ply_read_int(std::istream& s, const std::string& t, bool swap)
+{
+    return static_cast<int32_t>(ply_read_scalar(s, t, swap));
+}
+
+struct PLYProp {
+    std::string type, name;
+    bool is_list = false;
+    std::string count_type, elem_type;
+};
+
+} // namespace ply_detail
 
 static PCMesh ReadPLY(const std::string& path)
 {
-    std::ifstream f(path);
+    using namespace ply_detail;
+
+    std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open: " + path);
 
+    // ── Parse header ─────────────────────────────────────────────────────────
+    Fmt fmt = Fmt::ASCII;
     int n_verts = 0, n_faces = 0;
-    bool binary = false;
+    bool in_vertex = false, in_face = false;
+    std::vector<PLYProp> vert_props, face_props;
     std::string line;
 
     while (std::getline(f, line)) {
+        // Strip carriage-return for Windows-style line endings.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line == "end_header") break;
-        if (line.find("format binary") != std::string::npos) binary = true;
-        if (line.substr(0, 14) == "element vertex") n_verts = std::stoi(line.substr(15));
-        if (line.substr(0, 12) == "element face") n_faces = std::stoi(line.substr(13));
+
+        std::istringstream ss(line);
+        std::string tok; ss >> tok;
+
+        if (tok == "format") {
+            std::string fmtstr; ss >> fmtstr;
+            if (fmtstr == "binary_little_endian") fmt = Fmt::BIN_LE;
+            else if (fmtstr == "binary_big_endian") fmt = Fmt::BIN_BE;
+        } else if (tok == "element") {
+            std::string ename; int ecount; ss >> ename >> ecount;
+            in_vertex = (ename == "vertex");
+            in_face   = (ename == "face");
+            if (in_vertex) n_verts = ecount;
+            if (in_face)   n_faces = ecount;
+        } else if (tok == "property") {
+            std::string ptype; ss >> ptype;
+            PLYProp prop;
+            if (ptype == "list") {
+                prop.is_list = true;
+                ss >> prop.count_type >> prop.elem_type >> prop.name;
+            } else {
+                prop.type = ptype; ss >> prop.name;
+            }
+            if (in_vertex) vert_props.push_back(prop);
+            if (in_face)   face_props.push_back(prop);
+        }
     }
-    if (binary)
-        throw std::runtime_error(
-            "Binary PLY is not supported. Convert to ASCII PLY first "
-            "(e.g. with MeshLab: Filters > Remeshing > Simplification > Export ASCII).");
 
     PCMesh mesh;
     mesh.points.reserve(n_verts);
     mesh.faces.reserve(n_faces);
 
-    for (int i = 0; i < n_verts && std::getline(f, line); ++i) {
-        std::istringstream ss(line);
-        double x, y, z;
-        if (ss >> x >> y >> z) mesh.points.push_back({x, y, z});
+    if (fmt == Fmt::ASCII) {
+        // ── ASCII path ───────────────────────────────────────────────────────
+        for (int i = 0; i < n_verts && std::getline(f, line); ++i) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::istringstream ss2(line);
+            double x = 0, y = 0, z = 0;
+            // Parse named properties so extra fields (nx, rgb…) are ignored.
+            bool gx = false, gy = false, gz = false;
+            for (const auto& p : vert_props) {
+                double v; ss2 >> v;
+                if (p.name == "x") { x = v; gx = true; }
+                else if (p.name == "y") { y = v; gy = true; }
+                else if (p.name == "z") { z = v; gz = true; }
+            }
+            if (gx && gy && gz) mesh.points.push_back({x, y, z});
+        }
+        for (int i = 0; i < n_faces && std::getline(f, line); ++i) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::istringstream ss2(line);
+            int n; ss2 >> n;
+            std::vector<int> face(n);
+            for (int j = 0; j < n; ++j) ss2 >> face[j];
+            mesh.faces.push_back(face);
+        }
+    } else {
+        // ── Binary path ──────────────────────────────────────────────────────
+        const bool swap = (fmt == Fmt::BIN_BE);
+
+        // Find byte offsets for x, y, z among vertex properties.
+        int x_off = -1, y_off = -1, z_off = -1;
+        int vert_stride = 0;
+        for (const auto& p : vert_props) {
+            int sz = ply_type_size(p.type);
+            if (p.name == "x") x_off = vert_stride;
+            else if (p.name == "y") y_off = vert_stride;
+            else if (p.name == "z") z_off = vert_stride;
+            vert_stride += sz;
+        }
+        if (x_off < 0 || y_off < 0 || z_off < 0)
+            throw std::runtime_error("PLY file has no x/y/z vertex properties: " + path);
+
+        // Determine vertex property types for x, y, z.
+        std::string xt, yt, zt;
+        int running = 0;
+        for (const auto& p : vert_props) {
+            if (running == x_off) xt = p.type;
+            if (running == y_off) yt = p.type;
+            if (running == z_off) zt = p.type;
+            running += ply_type_size(p.type);
+        }
+
+        auto buf_read = [&](const char* buf, const std::string& t) -> double {
+            double val = 0;
+            if (t=="float"||t=="float32")   { float    v; std::memcpy(&v,buf,4); if(swap){auto*b=reinterpret_cast<uint8_t*>(&v);std::reverse(b,b+4);} val=v; }
+            else if (t=="double"||t=="float64") { double v; std::memcpy(&v,buf,8); if(swap){auto*b=reinterpret_cast<uint8_t*>(&v);std::reverse(b,b+8);} val=v; }
+            else if (t=="int"||t=="int32")  { int32_t  v; std::memcpy(&v,buf,4); if(swap){auto*b=reinterpret_cast<uint8_t*>(&v);std::reverse(b,b+4);} val=v; }
+            else if (t=="uint"||t=="uint32"){ uint32_t v; std::memcpy(&v,buf,4); if(swap){auto*b=reinterpret_cast<uint8_t*>(&v);std::reverse(b,b+4);} val=v; }
+            return val;
+        };
+
+        std::vector<char> vbuf(vert_stride);
+        for (int i = 0; i < n_verts; ++i) {
+            f.read(vbuf.data(), vert_stride);
+            mesh.points.push_back({
+                buf_read(vbuf.data() + x_off, xt),
+                buf_read(vbuf.data() + y_off, yt),
+                buf_read(vbuf.data() + z_off, zt)
+            });
+        }
+
+        // Find the face list property (vertex_indices / vertex_index).
+        std::string fc_type, fe_type;
+        int face_pre = 0; // bytes before the list property
+        for (const auto& p : face_props) {
+            if (p.is_list) { fc_type = p.count_type; fe_type = p.elem_type; break; }
+            face_pre += ply_type_size(p.type);
+        }
+
+        for (int i = 0; i < n_faces; ++i) {
+            if (face_pre) f.seekg(face_pre, std::ios::cur);
+            int count = ply_read_int(f, fc_type, swap);
+            std::vector<int> face(count);
+            for (int j = 0; j < count; ++j)
+                face[j] = ply_read_int(f, fe_type, swap);
+            mesh.faces.push_back(face);
+        }
     }
-    for (int i = 0; i < n_faces && std::getline(f, line); ++i) {
-        std::istringstream ss(line);
-        int n; ss >> n;
-        std::vector<int> face(n);
-        for (int j = 0; j < n; ++j) ss >> face[j];
-        mesh.faces.push_back(face);
-    }
+
     return mesh;
 }
 
