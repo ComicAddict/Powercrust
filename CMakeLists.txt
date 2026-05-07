@@ -7,12 +7,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── VTK ──────────────────────────────────────────────────────────────────────
-find_package(VTK REQUIRED)
-if(VTK_VERSION VERSION_LESS "8.90.0")
-  include(${VTK_USE_FILE})
-endif()
-
 # ── OpenMP ────────────────────────────────────────────────────────────────────
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -40,7 +34,7 @@ endif()
 include_directories(${SURFACERECONSTRUCTION_SOURCE_DIR})
 
 # ── PowerCrust library ────────────────────────────────────────────────────────
-add_library(PowerCrust vtkPowerCrustSurfaceReconstruction.cxx)
+add_library(PowerCrust powercrust.cxx)
 target_compile_features(PowerCrust PUBLIC cxx_std_17)
 
 if(OpenMP_CXX_FOUND)
@@ -60,19 +54,7 @@ if(COMPILER_SUPPORTS_AVX2)
   target_compile_definitions(PowerCrust PUBLIC PC_USE_AVX2)
 endif()
 
-if(VTK_VERSION VERSION_LESS "8.90.0")
-  target_link_libraries(PowerCrust PUBLIC ${VTK_LIBRARIES})
-else()
-  target_link_libraries(PowerCrust PUBLIC ${VTK_LIBRARIES})
-endif()
-
 # ── reconstruct executable ────────────────────────────────────────────────────
 add_executable(reconstruct ReconstructFromPoints.cxx)
 target_compile_features(reconstruct PRIVATE cxx_std_17)
-
-if(VTK_VERSION VERSION_LESS "8.90.0")
-  target_link_libraries(reconstruct PRIVATE ${VTK_LIBRARIES} PowerCrust)
-else()
-  target_link_libraries(reconstruct PRIVATE ${VTK_LIBRARIES} PowerCrust)
-  vtk_module_autoinit(TARGETS reconstruct MODULES ${VTK_LIBRARIES})
-endif()
+target_link_libraries(reconstruct PRIVATE PowerCrust)

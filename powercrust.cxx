@@ -16,14 +16,13 @@
 
 =========================================================================*/
 
-#include "vtkPowerCrustSurfaceReconstruction.h"
-#include "vtkFloatArray.h"
-#include "vtkObjectFactory.h"
-#include "vtkStreamingDemandDrivenPipeline.h"
-#include "vtkInformationVector.h"
-#include "vtkInformation.h"
-#include "vtkDataObject.h"
-#include "vtkSmartPointer.h"
+#include "powercrust.h"
+
+#include <array>
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 #ifdef PC_USE_OPENMP
 #  include <omp.h>
@@ -32,22 +31,48 @@
 #  include <immintrin.h>
 #endif
 
+/* ── Minimal geometry containers (replaces VTK types) ─────────────────── */
 
-vtkStandardNewMacro(vtkPowerCrustSurfaceReconstruction);
-
-vtkPowerCrustSurfaceReconstruction::vtkPowerCrustSurfaceReconstruction()
-{
-    this->SetNumberOfInputPorts(1);
-    this->SetNumberOfOutputPorts(1);
-
-    this->medial_surface = vtkPolyData::New();
-    m_estimate_r = 0.6;	// EPRO-added to change the default value
-}
-
-vtkPowerCrustSurfaceReconstruction::~vtkPowerCrustSurfaceReconstruction()
-{
-    this->medial_surface->Delete();
-}
+struct PCScalars {
+    std::vector<double> data;
+    void   InsertNextTuple1(double v)  { data.push_back(v); }
+    double GetTuple1(long i)   const   { return data.at(i); }
+};
+struct PCPointData {
+    PCScalars scalars;
+    PCScalars* GetScalars()            { return &scalars; }
+};
+struct PCPoints {
+    std::vector<std::array<double,3>> data;
+    long          GetNumberOfPoints()   const { return (long)data.size(); }
+    const double* GetPoint(long i)      const { return data[i].data(); }
+    void InsertNextPoint(double x, double y, double z) { data.push_back({x,y,z}); }
+    void InsertNextPoint(const float  v[3]) { data.push_back({(double)v[0],(double)v[1],(double)v[2]}); }
+    void InsertNextPoint(      double v[3]) { data.push_back({v[0],v[1],v[2]}); }
+};
+struct PCCells {
+    std::vector<std::vector<int>> data;
+private:
+    int _n = 0;
+    std::vector<int> _cur;
+public:
+    void InsertNextCell(int n) { _n = n; _cur.clear(); _cur.reserve(n); }
+    void InsertCellPoint(int idx) {
+        _cur.push_back(idx);
+        if ((int)_cur.size() == _n && _n > 0) data.push_back(_cur);
+    }
+};
+struct PCPolyData {
+    PCPoints     pts;
+    PCCells      polys_data;
+    PCPointData  pd;
+    long          GetNumberOfPoints() const   { return pts.GetNumberOfPoints(); }
+    const double* GetPoint(long i)    const   { return pts.GetPoint(i); }
+    PCPoints*     GetPoints()                 { return &pts; }
+    PCCells*      GetPolys()                  { return &polys_data; }
+    PCPointData*  GetPointData()              { return &pd; }
+    void          Modified()                  {}
+};
 
 
 
@@ -116,21 +141,16 @@ vtkPowerCrustSurfaceReconstruction::~vtkPowerCrustSurfaceReconstruction()
 --------------------------------------------------------------------- */
 
 
-// these globals are here so we can access them from anywhere in the powercrust code
-// if you can find a neat way to improve this then please feel free
-vtkDataSet* vtk_input;
-vtkPolyData* vtk_output;
-vtkPolyData* vtk_medial_surface;
+// Algorithm-global geometry containers (set by powercrust_run before adapted_main)
+static PCPolyData* pc_input  = nullptr;
+static PCPolyData* pc_output = nullptr;
+static PCPolyData* pc_medial = nullptr;
 
-// some hacks to enable us to have useful error reporting
-vtkPowerCrustSurfaceReconstruction *our_filter;
-void ASSERT(int b,const char* message="") {
-    if(!b)
-        our_filter->Error(message);
-}
-void vtkPowerCrustSurfaceReconstruction::Error(const char *message)
-{
-    vtkErrorMacro(<<"ASSERT:"<<message);
+static void ASSERT(int b, const char* message = "") {
+    if (!b) {
+        fprintf(stderr, "PowerCrust error: %s\n", message);
+        exit(1);
+    }
 }
 
 int pcFALSE = (1==0);
@@ -1165,7 +1185,7 @@ site vtk_read_next_site(long j)
 
     for(int i=0;i<dim;i++)
     {
-       p[i] = (double)vtk_input->GetPoint(j)[i];
+       p[i] = pc_input->GetPoint(j)[i];
        p[i] = floor(mult_up*p[i]+0.5);
        mins[i] = (mins[i]<p[i]) ? mins[i] : p[i];
        maxs[i] = (maxs[i]>p[i]) ? maxs[i] : p[i];
@@ -1183,9 +1203,9 @@ site vtk_pole_read_next_site(long j)
     for(int i=0;i<dim;i++)
     {
        if(i<3)
-         p[i] = (double)vtk_medial_surface->GetPoint(j)[i];
+         p[i] = pc_medial->GetPoint(j)[i];
        else
-         p[i] = (double)vtk_medial_surface->GetPointData()->GetScalars()->GetTuple1(j);
+         p[i] = pc_medial->GetPointData()->GetScalars()->GetTuple1(j);
        p[i] = floor(mult_up*p[i]+0.5);
        mins[i] = (mins[i]<p[i]) ? mins[i] : p[i];
        maxs[i] = (maxs[i]>p[i]) ? maxs[i] : p[i];
@@ -1433,8 +1453,7 @@ void adapted_main()
     /* some default values */
 
     mult_up = 1000000;
-//    est_r = 1; // EPRO - commented
-    est_r = our_filter->GetEstimate_r (); // EPRO
+    // est_r is set by powercrust_run() before adapted_main() is called
 
     pcInit ();	// EPRO added to initialize static variables for additional runs
 
@@ -1578,7 +1597,7 @@ void adapted_main()
 
         // TJH: we've replaced this file-reading loop with the loop below
         /*for(num_sites=0;read_next_site(num_sites);num_sites++);*/
-        for(num_sites=0;num_sites<vtk_input->GetNumberOfPoints();num_sites++)
+        for(num_sites=0;num_sites<pc_input->GetNumberOfPoints();num_sites++)
         {
             vtk_read_next_site(num_sites);
         }
@@ -1814,7 +1833,7 @@ void adapted_main()
     /* save points in order read */
     // TJH: we've bypassed the file handling
     //for (num_sites=0; read_next_site(num_sites); num_sites++);
-    for(num_sites=0;num_sites<vtk_medial_surface->GetNumberOfPoints();num_sites++)
+    for(num_sites=0;num_sites<pc_medial->GetNumberOfPoints();num_sites++)
     {
         vtk_pole_read_next_site(num_sites);
     }
@@ -2850,7 +2869,7 @@ void *compute_3d_power_edges(simplex *s, void *p) {
                                 vp[0]=prevs->vv[0];
                                 vp[1]=prevs->vv[1];
                                 vp[2]=prevs->vv[2];
-                                vtk_output->GetPoints()->InsertNextPoint(vp);
+                                pc_output->GetPoints()->InsertNextPoint(vp);
 
                             }
                             /* TJH: we have bypassed the file routines, so we don't need this bit
@@ -2906,7 +2925,7 @@ void *compute_3d_power_edges(simplex *s, void *p) {
                         vp[0]=prevs->vv[0];
                         vp[1]=prevs->vv[1];
                         vp[2]=prevs->vv[2];
-                        vtk_output->GetPoints()->InsertNextPoint(vp);
+                        pc_output->GetPoints()->InsertNextPoint(vp);
 
                     }
                     /* TJH: we have bypassed the file routines, so we don't need this bit
@@ -2916,7 +2935,7 @@ void *compute_3d_power_edges(simplex *s, void *p) {
                     // TJH: PNF contains the polygons (indices of their vertices)
                     // so we hijack the data and pipe it to our waiting vtkPolyData
                     // create the array of indices
-                    vtk_output->GetPolys()->InsertNextCell(numedges);
+                    pc_output->GetPolys()->InsertNextCell(numedges);
 
                     /* TJH: we have bypassed the file routines, so we don't need this bit
                     fprintf(PNF,"%d ",numedges);*/
@@ -2924,7 +2943,7 @@ void *compute_3d_power_edges(simplex *s, void *p) {
                         /* TJH: we have bypassed the file routines, so we don't need this bit
                         fprintf(PNF, "%d ",numvtxs-l);*/
                         // TJH: insert the next vertex index
-                        vtk_output->GetPolys()->InsertCellPoint(numvtxs-l);
+                        pc_output->GetPolys()->InsertCellPoint(numvtxs-l);
                     }
                     /* TJH: we have bypassed the file routines, so we don't need this bit
                     fprintf(PNF,"\n");numfaces++;*/
@@ -3011,10 +3030,10 @@ void *compute_axis (simplex *s, void *p) {
                     indices[v2[1]],indices[v1[3]]);*/
             // TJH: instead we pipe the data straight to our vtk structure
             {
-                vtk_medial_surface->GetPolys()->InsertNextCell(3);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[0]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v2[1]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[3]]);
+                pc_medial->GetPolys()->InsertNextCell(3);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[0]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v2[1]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[3]]);
             }
 
             num_axedgs++;
@@ -3032,10 +3051,10 @@ void *compute_axis (simplex *s, void *p) {
                     indices[v2[2]],indices[v1[5]]);*/
             // TJH: instead we pipe the data straight to our vtk structure
             {
-                vtk_medial_surface->GetPolys()->InsertNextCell(3);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[1]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v2[2]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[5]]);
+                pc_medial->GetPolys()->InsertNextCell(3);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[1]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v2[2]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[5]]);
             }
 
             num_axedgs++;
@@ -3054,10 +3073,10 @@ void *compute_axis (simplex *s, void *p) {
                     indices[v2[2]],indices[v1[4]]);*/
             // TJH: instead we pipe the data straight to our vtk structure
             {
-                vtk_medial_surface->GetPolys()->InsertNextCell(3);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[0]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v2[2]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[4]]);
+                pc_medial->GetPolys()->InsertNextCell(3);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[0]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v2[2]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[4]]);
             }
 
             num_axedgs++;
@@ -3075,10 +3094,10 @@ void *compute_axis (simplex *s, void *p) {
                     indices[v2[4]],indices[v1[5]]);*/
             // TJH: instead we pipe the data straight to our vtk structure
             {
-                vtk_medial_surface->GetPolys()->InsertNextCell(3);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[3]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v2[4]]);
-                vtk_medial_surface->GetPolys()->InsertCellPoint(indices[v1[5]]);
+                pc_medial->GetPolys()->InsertNextCell(3);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[3]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v2[4]]);
+                pc_medial->GetPolys()->InsertCellPoint(indices[v1[5]]);
             }
 
             num_axedgs++;
@@ -3164,7 +3183,7 @@ void construct_face(simplex *s, short k)
                     vp[0]=prevs->vv[0];
                     vp[1]=prevs->vv[1];
                     vp[2]=prevs->vv[2];
-                    vtk_output->GetPoints()->InsertNextPoint(vp);
+                    pc_output->GetPoints()->InsertNextPoint(vp);
 
                 }
                 /* TJH: we have bypassed the file routines, so we don't need this bit
@@ -3236,7 +3255,7 @@ void construct_face(simplex *s, short k)
             vp[0]=prevs->vv[0];
             vp[1]=prevs->vv[1];
             vp[2]=prevs->vv[2];
-            vtk_output->GetPoints()->InsertNextPoint(vp);
+            pc_output->GetPoints()->InsertNextPoint(vp);
 
         }
         /* TJH: we have bypassed the file routines, so we don't need this bit
@@ -3256,7 +3275,7 @@ void construct_face(simplex *s, short k)
     // TJH: PNF contains the polygons (indices of their vertices)
     // so we hijack the data and pipe it to our waiting vtkPolyData
     // create the array of indices
-    vtk_output->GetPolys()->InsertNextCell(numedges);
+    pc_output->GetPolys()->InsertNextCell(numedges);
 
     /* TJH: we have bypassed the file routines, so we don't need this bit
     fprintf(PNF,"%d ",numedges);*/
@@ -3269,7 +3288,7 @@ void construct_face(simplex *s, short k)
             // TJH: get the index of the vertex
             {
                 // TJH: convert indface[i] to an integer (drove me mad for ages till I spotted this!)
-                vtk_output->GetPolys()->InsertCellPoint(atoi(indface[i]));
+                pc_output->GetPolys()->InsertCellPoint(atoi(indface[i]));
             }
         }
     else
@@ -3281,7 +3300,7 @@ void construct_face(simplex *s, short k)
             // TJH: get the index of the vertex
             {
                 // TJH: convert indface[i] to an integer (drove me mad for ages till I spotted this!)
-                vtk_output->GetPolys()->InsertCellPoint(atoi(indface[i]));
+                pc_output->GetPolys()->InsertCellPoint(atoi(indface[i]));
             }
         }
 
@@ -4548,14 +4567,14 @@ void outputPole(/*TJH FILE* POLE, FILE* SPFILE, */simplex* pole, int poleid,
     /* TJH: we have bypassed the file routines, so we don't need this bit
     fprintf(POLE,"%f %f %f\n",pole->vv[0],
             pole->vv[1], pole->vv[2]);*/
-    vtk_medial_surface->GetPoints()->InsertNextPoint(pole->vv[0],pole->vv[1], pole->vv[2]);
+    pc_medial->GetPoints()->InsertNextPoint(pole->vv[0],pole->vv[1], pole->vv[2]);
 
     /* for computing powercrust */
     /* TJH: we have bypassed the file routines, so we don't need this bit
     fprintf(SPFILE,"%f %f %f %f\n",pole->vv[0],
             pole->vv[1], pole->vv[2],
             weight);*/
-    vtk_medial_surface->GetPointData()->GetScalars()->InsertNextTuple1(weight);
+    pc_medial->GetPointData()->GetScalars()->InsertNextTuple1(weight);
 
     /* remember squared radius */
     adjlist[poleid].sqradius = r2;
@@ -11650,105 +11669,30 @@ srand48(long seed)
 }
 //=====================================================================
 
-void vtkPowerCrustSurfaceReconstruction::PrintSelf(ostream& os, vtkIndent indent)
+PCResult powercrust_run(const PCMesh& input_mesh, double estimate_r)
 {
-  this->Superclass::PrintSelf(os,indent);
+    PCPolyData input_data, output_data, medial_data;
 
-}
+    for (const auto& pt : input_mesh.points)
+        input_data.GetPoints()->InsertNextPoint(pt[0], pt[1], pt[2]);
 
-int vtkPowerCrustSurfaceReconstruction::RequestUpdateExtent(
-  vtkInformation *vtkNotUsed(request),
-  vtkInformationVector **inputVector,
-  vtkInformationVector *outputVector)
-{
-  // get the info objects
-  vtkInformation *inInfo = inputVector[0]->GetInformationObject(0);
-  vtkInformation *outInfo = outputVector->GetInformationObject(0);
+    pc_input  = &input_data;
+    pc_output = &output_data;
+    pc_medial = &medial_data;
 
+    est_r = estimate_r;
 
-  inInfo->Set(vtkStreamingDemandDrivenPipeline::UPDATE_NUMBER_OF_PIECES(),
-              outInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_NUMBER_OF_PIECES()));
-  inInfo->Set(vtkStreamingDemandDrivenPipeline::UPDATE_PIECE_NUMBER(),
-              outInfo->Get(
-                vtkStreamingDemandDrivenPipeline::UPDATE_PIECE_NUMBER()));
-  inInfo->Set(vtkStreamingDemandDrivenPipeline::UPDATE_NUMBER_OF_GHOST_LEVELS(),
-              outInfo->Get(vtkStreamingDemandDrivenPipeline::UPDATE_NUMBER_OF_GHOST_LEVELS()));
+    adapted_main();
 
-  return 1;
-}
+    PCResult result;
+    result.surface.points        = output_data.pts.data;
+    result.surface.faces         = output_data.polys_data.data;
+    result.medial_axis.points    = medial_data.pts.data;
+    result.medial_axis.faces     = medial_data.polys_data.data;
+    result.medial_axis.point_scalars = medial_data.pd.scalars.data;
 
-
-int vtkPowerCrustSurfaceReconstruction::RequestData(vtkInformation *vtkNotUsed(request),
-                                             vtkInformationVector **inputVector,
-                                             vtkInformationVector *outputVector)
-{
-  // get the info objects
-  vtkInformation *inInfo = inputVector[0]->GetInformationObject(0);
-  vtkInformation *outInfo = outputVector->GetInformationObject(0);
-
-
-  // get the input and ouptut
-  vtkPolyData *input = vtkPolyData::SafeDownCast(
-      inInfo->Get(vtkDataObject::DATA_OBJECT()));
-
-  vtkPolyData *output = vtkPolyData::SafeDownCast(
-      outInfo->Get(vtkDataObject::DATA_OBJECT()));
-
-
-  vtkIdType numPts=input->GetNumberOfPoints();
-
-  {
-  vtkPoints *points = vtkPoints::New();
-  output->SetPoints(points);
-  points->Delete();
-  }
-
-  {
-  vtkCellArray *polys = vtkCellArray::New();
-  output->SetPolys(polys);
-  polys->Delete();
-  }
-
-  {
-  vtkPoints *points = vtkPoints::New();
-  this->medial_surface->SetPoints(points);
-  points->Delete();
-  }
-
-  {
-  vtkCellArray *polys = vtkCellArray::New();
-  this->medial_surface->SetPolys(polys);
-  polys->Delete();
-  }
-
-  {
-  vtkFloatArray *pole_weights = vtkFloatArray::New();
-  pole_weights->SetNumberOfComponents(1);
-  this->medial_surface->GetPointData()->SetScalars(pole_weights);
-  pole_weights->Delete();
-  }
-
-  vtk_input = input;
-  vtk_output = output;
-  vtk_medial_surface = this->medial_surface;
-  our_filter=this;
-
-  // this function is in hullmain.c
-  adapted_main();
-
-  this->medial_surface->Modified();
-
-  return 1;
-}
-
-
-void vtkPowerCrustSurfaceReconstruction::ExecuteInformation()
-{
-  if (this->GetInput() == NULL)
-    {
-    vtkErrorMacro("No Input");
-    return;
-    }
+    pc_input = pc_output = pc_medial = nullptr;
+    return result;
 }
 
 // EPRO added to reinitialize
