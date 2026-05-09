@@ -58,3 +58,16 @@ endif()
 add_executable(reconstruct ReconstructFromPoints.cxx)
 target_compile_features(reconstruct PRIVATE cxx_std_17)
 target_link_libraries(reconstruct PRIVATE PowerCrust)
+
+# ── Install ───────────────────────────────────────────────────────────────────
+include(GNUInstallDirs)
+
+install(TARGETS reconstruct
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(TARGETS PowerCrust
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+install(FILES powercrust.h MeshIO.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/powercrust)
